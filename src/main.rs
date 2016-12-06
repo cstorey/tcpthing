@@ -20,6 +20,7 @@ use pnet::packet::tcp::TcpOptionNumbers::TIMESTAMPS;
 use std::env;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::collections::{HashMap, BTreeMap};
+use std::num::Wrapping;
 use hex_slice::AsHex;
 use time::{SteadyTime, Duration};
 
@@ -29,9 +30,13 @@ struct Flows {
     flows: HashMap<FlowKey, Flow>,
 }
 
+type TSVal = Wrapping<u32>;
+#[derive(Debug)]
 struct Flow {
     // this should probably be some kind of cache instead.
-    observed: BTreeMap<u32, Option<SteadyTime>>,
+    observed: BTreeMap<TSVal, SteadyTime>,
+    seen_value: Option<TSVal>,
+    seen_echo: Option<TSVal>,
 }
 
 impl Flows {
@@ -116,24 +121,34 @@ impl Flows {
     }
 }
 
+const HALF_U32: TSVal = Wrapping(0x8000000);
+
 impl Flow {
     fn new() -> Self {
-        Flow { observed: BTreeMap::new() }
+        Flow {
+            observed: BTreeMap::new(),
+            seen_value: None,
+            seen_echo: None,
+        }
     }
 
     fn observe_outgoing(&mut self, at: SteadyTime, tsval: u32) {
-        if !self.observed.contains_key(&tsval) {
-            self.observed.insert(tsval, Some(at));
+        // println!("outgoing: {:?}; {:?}", self, tsval);
+        let tsval = Wrapping(tsval);
+        // If it's before or equal to this value, modulo
+        if self.seen_value.map(|v| (tsval - v) < HALF_U32).unwrap_or(true) {
+            self.observed.insert(tsval, at);
+            self.seen_value = Some(tsval)
         }
     }
     fn observe_echo(&mut self, at: SteadyTime, tsecr: u32) {
-        if let Some(val) = self.observed.get_mut(&tsecr) {
-            if let &mut Some(stamp) = val {
+        // println!("echo: {:?}; {:?}", self, tsecr);
+        let tsecr = Wrapping(tsecr);
+        if self.seen_echo.map(|v| (tsecr - v) < HALF_U32).unwrap_or(true) {
+            if let Some(stamp) = self.observed.remove(&tsecr) {
                 let delta = at - stamp;
                 println!("\tRTT: {}", delta);
-            };
-
-            *val = None;
+            }
         }
     }
 }
