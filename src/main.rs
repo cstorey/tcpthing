@@ -91,11 +91,23 @@ impl Flows {
                                         (p[7] as u32) << 0;
 
                             let t = self.now();
-                            println!("{:?}\ttimestamps: val: {}; ecr: {}\tat: {:?}",
-                                     flow,
-                                     tsval,
-                                     tsecr,
-                                     t);
+                            print!("{:?}\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} ",
+                                   flow,
+                                   tsval,
+                                   tsecr,
+                                   tcp.get_sequence(),
+                                   tcp.get_acknowledgement());
+                            use  pnet::packet::tcp::TcpFlags::*;
+                            for &(chr, flag) in &[('A', ACK), ('C', CWR), ('E', ECE), ('F', FIN),
+                                                  ('N', NS), ('P', PSH), ('R', RST), ('S', SYN),
+                                                  ('U', URG)] {
+                                if (tcp.get_flags() & flag) != 0 {
+                                    print!("{}", chr);
+                                } else {
+                                    print!(".");
+                                }
+                            }
+                            print!("\t");
 
                             self.flows
                                 .entry((src, dst))
@@ -105,6 +117,8 @@ impl Flows {
                                 .entry((dst, src))
                                 .or_insert_with(|| Flow::new())
                                 .observe_echo(t, tsecr);
+                            println!("");
+                            // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
                         } else {
                             // Approxmate using sequence numbers?
                         }
@@ -121,7 +135,8 @@ impl Flows {
     }
 }
 
-const HALF_U32: TSVal = Wrapping(0x8000000);
+const HALF_U32: TSVal = Wrapping(0x80000000);
+const HALF_SUB_EPSILON: TSVal = Wrapping(0x7fffffff);
 
 impl Flow {
     fn new() -> Self {
@@ -133,21 +148,27 @@ impl Flow {
     }
 
     fn observe_outgoing(&mut self, at: SteadyTime, tsval: u32) {
-        // println!("outgoing: {:?}; {:?}", self, tsval);
         let tsval = Wrapping(tsval);
         // If it's before or equal to this value, modulo
-        if self.seen_value.map(|v| (tsval - v) < HALF_U32).unwrap_or(true) {
+        let tsdelta = self.seen_value.map(|v| (tsval - v)).unwrap_or(HALF_SUB_EPSILON);
+        // println!("");
+        // println!("{:?}", self);
+        // println!("val delta:{:08x}", tsdelta);
+        if tsdelta < HALF_U32 {
             self.observed.insert(tsval, at);
             self.seen_value = Some(tsval)
         }
     }
     fn observe_echo(&mut self, at: SteadyTime, tsecr: u32) {
-        // println!("echo: {:?}; {:?}", self, tsecr);
         let tsecr = Wrapping(tsecr);
-        if self.seen_echo.map(|v| (tsecr - v) < HALF_U32).unwrap_or(true) {
+        let tsdelta = self.seen_echo.map(|v| (tsecr - v)).unwrap_or(HALF_SUB_EPSILON);
+        // println!("{:?}", self);
+        // println!("ecr delta:{:08x}", tsdelta);
+        if tsdelta < HALF_U32 {
             if let Some(stamp) = self.observed.remove(&tsecr) {
                 let delta = at - stamp;
-                println!("\tRTT: {}", delta);
+                print!("\tRTT: {}", delta);
+                self.seen_echo = Some(tsecr);
             }
         }
     }
