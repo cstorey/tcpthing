@@ -4,6 +4,7 @@ extern crate log;
 extern crate env_logger;
 extern crate hex_slice;
 extern crate time;
+extern crate hdrhistogram;
 
 use pnet::datalink::{self, NetworkInterface};
 
@@ -23,6 +24,7 @@ use std::collections::{HashMap, BTreeMap};
 use std::num::Wrapping;
 use hex_slice::AsHex;
 use time::{SteadyTime, Duration};
+use hdrhistogram::Histogram;
 
 type FlowKey = (SocketAddr, SocketAddr);
 
@@ -31,12 +33,12 @@ struct Flows {
 }
 
 type TSVal = Wrapping<u32>;
-#[derive(Debug)]
 struct Flow {
     // this should probably be some kind of cache instead.
     observed: BTreeMap<TSVal, SteadyTime>,
     seen_value: Option<TSVal>,
     seen_echo: Option<TSVal>,
+    histogram_us: Histogram,
 }
 
 impl Flows {
@@ -144,6 +146,7 @@ impl Flow {
             observed: BTreeMap::new(),
             seen_value: None,
             seen_echo: None,
+            histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram"),
         }
     }
 
@@ -168,6 +171,13 @@ impl Flow {
             if let Some(stamp) = self.observed.remove(&tsecr) {
                 let delta = at - stamp;
                 print!("\tRTT: {}", delta);
+                if let Some(us) = delta.num_microseconds()
+                    .and_then(|v| if v > 0 { Some(v) } else { None }) {
+                    self.histogram_us.record_value(us as u64);
+                    if let Ok(b64) = self.histogram_us.encode() {
+                        print!("\t{}", b64);
+                    }
+                }
                 self.seen_echo = Some(tsecr);
             }
         }
