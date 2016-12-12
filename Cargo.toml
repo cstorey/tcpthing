@@ -10,6 +10,8 @@ log = "0.3.6"
 lru_time_cache = "0.5.0"
 pcap = "0.5.7"
 pnet = "0.14.0"
+prometheus = "0.2.6"
+protobuf = "1.0.24"
 time = "0.1.35"
 
 [dependencies.hex-slice]

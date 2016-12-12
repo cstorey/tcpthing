@@ -7,6 +7,8 @@ extern crate hex_slice;
 extern crate time;
 extern crate hdrhistogram;
 extern crate lru_time_cache;
+extern crate prometheus;
+extern crate protobuf;
 
 use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
@@ -200,13 +202,65 @@ impl StatsTracker {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     next_deadline = SteadyTime::now() + Duration::seconds(1);
-                    for (&FlowKey(src, dst), stat) in self.stats.iter() {
-                        info!("{}:{}: {}", src, dst, stat);
-                    }
+                    self.dump_stats();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+    fn dump_stats(&mut self) {
+        use protobuf::RepeatedField;
+        use prometheus::{Opts, Registry, Counter, TextEncoder, Encoder};
+        use prometheus::proto;
+        use std::io::{self, Write};
+        let mut metric_families = Vec::new();
+        for (&FlowKey(src, dst), stat) in self.stats.iter() {
+            info!("{}:{}: {}", src, dst, stat);
+            let mut h = proto::Histogram::new();
+
+            let mut cumulative = 0;
+            let mut sum = 0f64;
+            let mut buckets = Vec::new();
+            for pct in stat.histogram_us.percentile_iter(1) {
+                cumulative += pct.count;
+                sum += pct.value as f64;
+                let mut b = proto::Bucket::new();
+                b.set_cumulative_count(cumulative);
+                b.set_upper_bound(pct.highest_equivalent_value as f64);
+                buckets.push(b);
+            }
+            h.set_bucket(RepeatedField::from_vec(buckets));
+            h.set_sample_sum(sum);
+            h.set_sample_count(cumulative);
+
+            let mut metric = proto::Metric::new();
+            metric.set_label(RepeatedField::from_vec(vec![
+                        ("src_ip", format!("{}", src.ip())),
+                        ("dst_ip", format!("{}", dst.ip())),
+                        ("src_port", format!("{}", src.port())),
+                        ("dst_port", format!("{}", dst.port())),
+                            ]
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut lp = proto::LabelPair::new();
+                    lp.set_name(k.to_string());
+                    lp.set_value(v);
+                    lp
+                })
+                .collect()));
+            metric.set_histogram(h);
+
+            let mut mf = proto::MetricFamily::new();
+            mf.set_name("tcp_rtt".to_string());
+            mf.set_help("TCP Timestamp RTT".to_string());
+            mf.set_field_type(proto::MetricType::HISTOGRAM);
+            mf.set_metric(RepeatedField::from_vec(vec![metric]));
+            metric_families.push(mf)
+        }
+        let mut buffer = Vec::new();
+        let encoder = TextEncoder::new();
+        encoder.encode(&metric_families, &mut buffer).expect("encode");
+        io::stdout().write_all(&buffer).expect("write");
     }
 }
 
