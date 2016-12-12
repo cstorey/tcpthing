@@ -9,6 +9,7 @@ extern crate hdrsample;
 extern crate lru_time_cache;
 extern crate prometheus;
 extern crate protobuf;
+extern crate hyper;
 
 use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
@@ -26,6 +27,12 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::fmt;
 use std::cmp::{Ordering, max};
+use prometheus::{TextEncoder, Encoder};
+use std::io::{self, Write};
+
+use hyper::header::ContentType;
+use hyper::server::{Server, Request, Response};
+use hyper::mime::Mime;
 
 #[derive(Clone,Eq,PartialEq,Hash)]
 struct FlowKey(SocketAddr, SocketAddr);
@@ -199,11 +206,9 @@ impl StatsTracker {
             }
         }
     }
-    fn dump_stats(&mut self) {
+    fn to_metric_families(&self) -> Vec<prometheus::proto::MetricFamily> {
         use protobuf::RepeatedField;
-        use prometheus::{TextEncoder, Encoder};
         use prometheus::proto;
-        use std::io::{self, Write};
         let mut metric_families = Vec::new();
         let stats = self.stats.read().expect("read lock");
         for (&FlowKey(src, dst), stat) in stats.peek_iter() {
@@ -243,16 +248,20 @@ impl StatsTracker {
             metric.set_histogram(h);
 
             let mut mf = proto::MetricFamily::new();
-            mf.set_name("tcp_rtt".to_string());
+            mf.set_name("tcp_rtt_us".to_string());
             mf.set_help("TCP Timestamp RTT".to_string());
             mf.set_field_type(proto::MetricType::HISTOGRAM);
             mf.set_metric(RepeatedField::from_vec(vec![metric]));
             metric_families.push(mf)
         }
+        metric_families
+    }
+
+    fn dump_stats(&mut self) -> Vec<u8> {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();
-        encoder.encode(&metric_families, &mut buffer).expect("encode");
-        io::stdout().write_all(&buffer).expect("write");
+        encoder.encode(&self.to_metric_families(), &mut buffer).expect("encode");
+        buffer
     }
 }
 
@@ -324,7 +333,7 @@ fn process_all(stats: &mut StatsTracker, rx: mpsc::Receiver<StatUpdate>) {
         let now = SteadyTime::now();
         if next_deadline <= now {
             next_deadline = SteadyTime::now() + Duration::seconds(1);
-            stats.dump_stats();
+            io::stdout().write_all(&stats.dump_stats()).expect("write");
         }
 
         let delta = max(next_deadline - now, Duration::seconds(0));
@@ -368,5 +377,30 @@ fn main() {
         })
         .expect("thread spawn");
 
+    thread::Builder::new()
+        .name("http".to_string())
+        .spawn({
+            let stats = stats.clone();
+            let addr = "127.0.0.1:9898";
+            println!("listening addr {:?}", addr);
+            let server = Server::http(addr).expect("http server");
+            move || {
+                server.handle(move |_req: Request, mut res: Response| {
+                        println!("Req: {:?}", (_req.method, _req.uri, _req.headers));
+                        let mut buffer = Vec::new();
+                        let encoder = TextEncoder::new();
+                        encoder.encode(&stats.to_metric_families(), &mut buffer).expect("encode");
+
+                        res.headers_mut().set(ContentType(encoder.format_type()
+                            .parse::<Mime>()
+                            .expect("mime parse")));
+                        res.send(&buffer).expect("send")
+                    })
+                    .expect("server")
+            }
+        })
+        .expect("serve");
+
+    println!("Processing");
     captor.process_from(pcap);
 }
