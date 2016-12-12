@@ -21,14 +21,13 @@ use std::env;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::collections::BTreeMap;
 use std::num::Wrapping;
-use time::{Timespec, SteadyTime, Duration};
+use time::{Timespec, Duration};
 use hdrsample::Histogram;
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::fmt;
-use std::cmp::{Ordering, max};
+use std::cmp::Ordering;
 use prometheus::{TextEncoder, Encoder};
-use std::io::{self, Write};
 
 use hyper::header::ContentType;
 use hyper::server::{Server, Request, Response};
@@ -201,7 +200,7 @@ impl StatsTracker {
                 let mut ent = stats.entry(FlowKey(dst, src))
                     .or_insert_with(|| FlowStat::new());
                 ent.record(delta);
-                debug!("Record: {}:{}; {}", src, dst, ent);
+                trace!("Record: {}:{}; {}", src, dst, ent);
 
             }
         }
@@ -212,7 +211,6 @@ impl StatsTracker {
         let mut metric_families = Vec::new();
         let stats = self.stats.read().expect("read lock");
         for (&FlowKey(src, dst), stat) in stats.peek_iter() {
-            info!("{}:{}: {}", src, dst, stat);
             let mut h = proto::Histogram::new();
 
             let mut cumulative = 0;
@@ -255,13 +253,6 @@ impl StatsTracker {
             metric_families.push(mf)
         }
         metric_families
-    }
-
-    fn dump_stats(&mut self) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        let encoder = TextEncoder::new();
-        encoder.encode(&self.to_metric_families(), &mut buffer).expect("encode");
-        buffer
     }
 }
 
@@ -328,22 +319,11 @@ impl fmt::Display for FlowStat {
 }
 
 fn process_all(stats: &mut StatsTracker, rx: mpsc::Receiver<StatUpdate>) {
-    let mut next_deadline = SteadyTime::now() + Duration::seconds(1);
-    loop {
-        let now = SteadyTime::now();
-        if next_deadline <= now {
-            next_deadline = SteadyTime::now() + Duration::seconds(1);
-            io::stdout().write_all(&stats.dump_stats()).expect("write");
-        }
-
-        let delta = max(next_deadline - now, Duration::seconds(0));
-        match rx.recv_timeout(delta.to_std().expect("std::time")) {
-            Ok(update) => stats.process(update),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
+    for update in rx.iter() {
+        stats.process(update)
     }
 }
+
 fn main() {
     env_logger::init().expect("env_logger");
 
