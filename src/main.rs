@@ -170,8 +170,10 @@ impl Flow {
                     .and_then(|v| if v > 0 { Some(v) } else { None }) {
                     self.histogram_us.record_value(us as u64);
                     print!("/{}μs", us as u64);
+                    let mut cumulative = 0;
                     for pct in self.histogram_us.percentile_iter(1) {
-                        print!(" {:.3}%:{}μs", pct.percentile, pct.value);
+                        cumulative += pct.count;
+                        print!(" {:.3}%/{}:{}μs", pct.percentile, cumulative, pct.value);
                     }
                 }
                 self.seen_echo = Some(tsecr);
