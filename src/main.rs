@@ -202,7 +202,7 @@ impl StatsTracker {
                 let mut ent = stats.entry(FlowKey(dst, src))
                     .or_insert_with(|| FlowStat::new());
                 ent.record(delta);
-                trace!("Record: {}:{}; {}", src, dst, ent);
+                trace!("Record: {}:{}; {}; {}", src, dst, delta, ent);
 
             }
         }
@@ -218,8 +218,10 @@ impl StatsTracker {
             let mut cumulative = 0;
             let mut sum = 0f64;
             let mut buckets = Vec::new();
-            for (value, _percentile, count, _nsamples) in stat.histogram_us.iter_log(1, TWO_SQRT) {
-                cumulative += count;
+            trace!("{}:{}", src, dst);
+            for (value, _percentile, _count, nsamples) in stat.histogram_us.iter_log(1, TWO_SQRT) {
+                trace!("{},{},{},{}", value, _percentile, _count, nsamples);
+                cumulative += nsamples as u64;
                 sum += value as f64;
                 let mut b = proto::Bucket::new();
                 b.set_cumulative_count(cumulative);
@@ -314,8 +316,8 @@ impl FlowStat {
 
 impl fmt::Display for FlowStat {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        for (value, percentile, count, _nsamples) in self.histogram_us.iter_percentiles(1) {
-            try!(write!(fmt, " {:.3}%/{}:{}μs", percentile, count, value));
+        for (value, percentile, _count, nsamples) in self.histogram_us.iter_percentiles(1) {
+            try!(write!(fmt, " {:.3}%/{}:{}μs", percentile, nsamples, value));
         }
         Ok(())
     }
