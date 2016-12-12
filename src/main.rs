@@ -17,13 +17,14 @@ use std::env;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::collections::{HashMap, BTreeMap};
 use std::num::Wrapping;
-use time::Timespec;
+use time::{Timespec, Duration};
 use hdrhistogram::Histogram;
 
 type FlowKey = (SocketAddr, SocketAddr);
 
-struct Flows {
+struct Tracker {
     flows: HashMap<FlowKey, Flow>,
+    stats: HashMap<FlowKey, FlowStat>,
 }
 
 type TSVal = Wrapping<u32>;
@@ -32,12 +33,18 @@ struct Flow {
     observed: BTreeMap<TSVal, Timespec>,
     seen_value: Option<TSVal>,
     seen_echo: Option<TSVal>,
+}
+
+struct FlowStat {
     histogram_us: Histogram,
 }
 
-impl Flows {
+impl Tracker {
     fn new() -> Self {
-        Flows { flows: HashMap::new() }
+        Tracker {
+            flows: HashMap::new(),
+            stats: HashMap::new(),
+        }
     }
 
     fn process_from(&mut self, mut rx: pcap::Capture<pcap::Active>) {
@@ -110,10 +117,16 @@ impl Flows {
                                 .entry((src, dst))
                                 .or_insert_with(|| Flow::new())
                                 .observe_outgoing(now, tsval);
-                            self.flows
+                            let obs = self.flows
                                 .entry((dst, src))
                                 .or_insert_with(|| Flow::new())
                                 .observe_echo(now, tsecr);
+                            if let Some(obs) = obs {
+                                self.stats
+                                    .entry((dst, src))
+                                    .or_insert_with(|| FlowStat::new())
+                                    .record(obs)
+                            }
                             println!("");
                             // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
                         } else {
@@ -141,7 +154,6 @@ impl Flow {
             observed: BTreeMap::new(),
             seen_value: None,
             seen_echo: None,
-            histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram"),
         }
     }
 
@@ -157,7 +169,7 @@ impl Flow {
             self.seen_value = Some(tsval)
         }
     }
-    fn observe_echo(&mut self, at: Timespec, tsecr: u32) {
+    fn observe_echo(&mut self, at: Timespec, tsecr: u32) -> Option<Duration> {
         let tsecr = Wrapping(tsecr);
         let tsdelta = self.seen_echo.map(|v| (tsecr - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("{:?}", self);
@@ -166,17 +178,28 @@ impl Flow {
             if let Some(stamp) = self.observed.remove(&tsecr) {
                 let delta = at - stamp;
                 print!("\tRTT: {}", delta);
-                if let Some(us) = delta.num_microseconds()
-                    .and_then(|v| if v > 0 { Some(v) } else { None }) {
-                    self.histogram_us.record_value(us as u64);
-                    print!("/{}μs", us as u64);
-                    let mut cumulative = 0;
-                    for pct in self.histogram_us.percentile_iter(1) {
-                        cumulative += pct.count;
-                        print!(" {:.3}%/{}:{}μs", pct.percentile, cumulative, pct.value);
-                    }
-                }
+
                 self.seen_echo = Some(tsecr);
+                return Some(delta);
+            }
+        }
+        None
+    }
+}
+impl FlowStat {
+    fn new() -> Self {
+        FlowStat { histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram") }
+    }
+
+    fn record(&mut self, delta: Duration) {
+        if let Some(us) = delta.num_microseconds()
+            .and_then(|v| if v > 0 { Some(v) } else { None }) {
+            self.histogram_us.record_value(us as u64);
+            print!("/{}μs", us as u64);
+            let mut cumulative = 0;
+            for pct in self.histogram_us.percentile_iter(1) {
+                cumulative += pct.count;
+                print!(" {:.3}%/{}:{}μs", pct.percentile, cumulative, pct.value);
             }
         }
     }
@@ -204,7 +227,7 @@ fn main() {
         println!("Using program: {}", program);
     }
 
-    let mut captor = Flows::new();
+    let mut captor = Tracker::new();
 
     captor.process_from(rx);
 }
