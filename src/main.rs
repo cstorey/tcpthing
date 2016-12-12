@@ -15,10 +15,11 @@ use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::tcp::TcpOptionNumbers::TIMESTAMPS;
 use std::env;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::collections::BTreeMap;
 use std::num::Wrapping;
 use time::{Timespec, Duration};
@@ -120,73 +121,100 @@ impl Tracker {
                                                                    tcp.get_source()));
                         let dst = SocketAddr::V4(SocketAddrV4::new(ipv4.get_destination(),
                                                                    tcp.get_destination()));
-                        // println!("{:?}: expected sz: {:?}; len: {:?}", flow, tcp.packet_size(), ipv4.packet().len());
-
-                        if let Some(ts) = tcp.get_options_iter()
-                            .filter(|o| o.get_number() == TIMESTAMPS)
-                            .next() {
-                            let p = ts.payload();
-                            let tsval = (p[0] as u32) << 24 | (p[1] as u32) << 16 |
-                                        (p[2] as u32) << 8 |
-                                        (p[3] as u32) << 0;
-                            let tsecr = (p[4] as u32) << 24 | (p[5] as u32) << 16 |
-                                        (p[6] as u32) << 8 |
-                                        (p[7] as u32) << 0;
-
-                            self.flows
-                                .entry(FlowKey(src, dst))
-                                .or_insert_with(|| Flow::new())
-                                .observe_outgoing(now, tsval);
-                            let obs = self.flows
-                                .entry(FlowKey(dst, src))
-                                .or_insert_with(|| Flow::new())
-                                .observe_echo(now, tsecr);
-
-                            use  pnet::packet::tcp::TcpFlags::*;
-                            trace!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} \
-                                    flags: {}; rtt:{:?}",
-                                   src,
-                                   dst,
-                                   tsval,
-                                   tsecr,
-                                   tcp.get_sequence(),
-                                   tcp.get_acknowledgement(),
-
-                                   &[('A', ACK), ('C', CWR), ('E', ECE), ('F', FIN), ('N', NS),
-                                     ('P', PSH), ('R', RST), ('S', SYN), ('U', URG)]
-                                       .iter()
-                                       .cloned()
-                                       .filter_map(|(chr, flag)| {
-                                    if (tcp.get_flags() & flag) != 0 {
-                                        Some(chr)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                       .collect::<String>(),
-                                   obs);
-
-                            if let Some(obs) = obs {
-                                match self.stats.try_send(StatUpdate::TstampVals(src, dst, obs)) {
-                                    Ok(_) => (),
-                                    Err(mpsc::TrySendError::Full(e)) => warn!("Drop for {:?}", e),
-                                    Err(e) => panic!("Unexpected: {:?}", e),
-                                }
-                            }
-                            // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
-                        } else {
-                            // Approxmate using sequence numbers?
-                        }
+                        self.process_tcp_packet(now, src, dst, tcp)
                     }
                 }
             }
             EtherTypes::Ipv6 => {
-                warn!("Ignoring ipv6");
+                if let Some(ipv6) = Ipv6Packet::new(ethernet.payload()) {
+                    match ipv6.get_next_header() {
+                        IpNextHeaderProtocols::Tcp => (),
+                        other => {
+                            warn!("Ignoring: {:?}", other);
+                            return;
+                        }
+                    };
+
+                    if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
+
+                        let src = SocketAddr::V6(SocketAddrV6::new(ipv6.get_source(),
+                                                                   tcp.get_source(),
+                                                                   ipv6.get_flow_label(),
+                                                                   0));
+                        let dst = SocketAddr::V6(SocketAddrV6::new(ipv6.get_destination(),
+                                                                   tcp.get_destination(),
+                                                                   ipv6.get_flow_label(),
+                                                                   0));
+                        self.process_tcp_packet(now, src, dst, tcp)
+                    }
+                }
             }
             other => {
                 warn!("Ignoring: {:?}", other);
             }
         };
+    }
+
+    fn process_tcp_packet(&mut self,
+                          now: Timespec,
+                          src: SocketAddr,
+                          dst: SocketAddr,
+                          tcp: TcpPacket) {
+        // println!("{:?}: expected sz: {:?}; len: {:?}", flow, tcp.packet_size(), ipv4.packet().len());
+
+        if let Some(ts) = tcp.get_options_iter()
+            .filter(|o| o.get_number() == TIMESTAMPS)
+            .next() {
+            let p = ts.payload();
+            let tsval = (p[0] as u32) << 24 | (p[1] as u32) << 16 | (p[2] as u32) << 8 |
+                        (p[3] as u32) << 0;
+            let tsecr = (p[4] as u32) << 24 | (p[5] as u32) << 16 | (p[6] as u32) << 8 |
+                        (p[7] as u32) << 0;
+
+            self.flows
+                .entry(FlowKey(src, dst))
+                .or_insert_with(|| Flow::new())
+                .observe_outgoing(now, tsval);
+            let obs = self.flows
+                .entry(FlowKey(dst, src))
+                .or_insert_with(|| Flow::new())
+                .observe_echo(now, tsecr);
+
+            use  pnet::packet::tcp::TcpFlags::*;
+            trace!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} flags: {}; rtt:{:?}",
+                   src,
+                   dst,
+                   tsval,
+                   tsecr,
+                   tcp.get_sequence(),
+                   tcp.get_acknowledgement(),
+
+                   &[('A', ACK), ('C', CWR), ('E', ECE), ('F', FIN), ('N', NS), ('P', PSH),
+                     ('R', RST), ('S', SYN), ('U', URG)]
+                       .iter()
+                       .cloned()
+                       .filter_map(|(chr, flag)| {
+                    if (tcp.get_flags() & flag) != 0 {
+                        Some(chr)
+                    } else {
+                        None
+                    }
+                })
+                       .collect::<String>(),
+                   obs);
+
+            if let Some(obs) = obs {
+                match self.stats.try_send(StatUpdate::TstampVals(src, dst, obs)) {
+                    Ok(_) => (),
+                    Err(mpsc::TrySendError::Full(e)) => warn!("Drop for {:?}", e),
+                    Err(e) => panic!("Unexpected: {:?}", e),
+                }
+            }
+            // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
+        } else {
+            // Approxmate using sequence numbers?
+        }
+
     }
 }
 
