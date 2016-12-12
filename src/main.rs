@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::num::Wrapping;
 use time::{Timespec, SteadyTime, Duration};
 use hdrsample::Histogram;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::fmt;
 use std::cmp::{Ordering, max};
@@ -51,9 +51,9 @@ struct Tracker {
     stats: mpsc::SyncSender<StatUpdate>,
 }
 
+#[derive(Clone)]
 struct StatsTracker {
-    rx: mpsc::Receiver<StatUpdate>,
-    stats: LruCache<FlowKey, FlowStat>,
+    stats: Arc<RwLock<LruCache<FlowKey, FlowStat>>>,
 }
 
 type TSVal = Wrapping<u32>;
@@ -74,10 +74,10 @@ enum StatUpdate {
 }
 
 impl Tracker {
-    fn new(rx: mpsc::SyncSender<StatUpdate>) -> Self {
+    fn new(tx: mpsc::SyncSender<StatUpdate>) -> Self {
         Tracker {
             flows: LruCache::with_capacity(1024),
-            stats: rx,
+            stats: tx,
         }
     }
 
@@ -183,33 +183,19 @@ impl Tracker {
 }
 
 impl StatsTracker {
-    fn new(rx: mpsc::Receiver<StatUpdate>) -> Self {
-        StatsTracker {
-            rx: rx,
-            stats: LruCache::with_capacity(1024),
-        }
+    fn new() -> Self {
+        StatsTracker { stats: Arc::new(RwLock::new(LruCache::with_capacity(1024))) }
     }
-    fn process_all(&mut self) {
-        let mut next_deadline = SteadyTime::now() + Duration::seconds(1);
-        loop {
-            let now = SteadyTime::now();
-            if next_deadline <= now {
-                next_deadline = SteadyTime::now() + Duration::seconds(1);
-                self.dump_stats();
-            }
 
-            let delta = max(next_deadline - now, Duration::seconds(0));
-            match self.rx
-                .recv_timeout(delta.to_std().expect("std::time")) {
-                Ok(StatUpdate::TstampVals(src, dst, delta)) => {
-                    let mut ent = self.stats
-                        .entry(FlowKey(dst, src))
-                        .or_insert_with(|| FlowStat::new());
-                    ent.record(delta);
-                    debug!("Record: {}:{}; {}", src, dst, ent);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+    fn process(&mut self, update: StatUpdate) {
+        match update {
+            StatUpdate::TstampVals(src, dst, delta) => {
+                let mut stats = self.stats.write().expect("write lock");
+                let mut ent = stats.entry(FlowKey(dst, src))
+                    .or_insert_with(|| FlowStat::new());
+                ent.record(delta);
+                debug!("Record: {}:{}; {}", src, dst, ent);
+
             }
         }
     }
@@ -219,7 +205,8 @@ impl StatsTracker {
         use prometheus::proto;
         use std::io::{self, Write};
         let mut metric_families = Vec::new();
-        for (&FlowKey(src, dst), stat) in self.stats.iter() {
+        let stats = self.stats.read().expect("read lock");
+        for (&FlowKey(src, dst), stat) in stats.peek_iter() {
             info!("{}:{}: {}", src, dst, stat);
             let mut h = proto::Histogram::new();
 
@@ -331,6 +318,23 @@ impl fmt::Display for FlowStat {
     }
 }
 
+fn process_all(stats: &mut StatsTracker, rx: mpsc::Receiver<StatUpdate>) {
+    let mut next_deadline = SteadyTime::now() + Duration::seconds(1);
+    loop {
+        let now = SteadyTime::now();
+        if next_deadline <= now {
+            next_deadline = SteadyTime::now() + Duration::seconds(1);
+            stats.dump_stats();
+        }
+
+        let delta = max(next_deadline - now, Duration::seconds(0));
+        match rx.recv_timeout(delta.to_std().expect("std::time")) {
+            Ok(update) => stats.process(update),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
 fn main() {
     env_logger::init().expect("env_logger");
 
@@ -355,10 +359,13 @@ fn main() {
 
     let (tx, rx) = mpsc::sync_channel(1024);
     let mut captor = Tracker::new(tx);
-    let mut stats = StatsTracker::new(rx);
+    let stats = StatsTracker::new();
     thread::Builder::new()
         .name("stats".to_string())
-        .spawn(move || stats.process_all())
+        .spawn({
+            let mut stats = stats.clone();
+            move || process_all(&mut stats, rx)
+        })
         .expect("thread spawn");
 
     captor.process_from(pcap);
