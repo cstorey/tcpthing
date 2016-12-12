@@ -17,10 +17,11 @@ use std::env;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::collections::{HashMap, BTreeMap};
 use std::num::Wrapping;
-use time::{Timespec, Duration};
+use time::{Timespec, SteadyTime, Duration};
 use hdrhistogram::Histogram;
 use std::sync::mpsc;
 use std::thread;
+use std::fmt;
 
 type FlowKey = (SocketAddr, SocketAddr);
 
@@ -43,8 +44,6 @@ struct Flow {
 }
 
 struct FlowStat {
-    src: SocketAddr,
-    dst: SocketAddr,
     histogram_us: Histogram,
 }
 
@@ -170,14 +169,23 @@ impl StatsTracker {
         }
     }
     fn process_all(&mut self) {
-        for upd in self.rx.iter() {
-            match upd {
-                StatUpdate::TstampVals(src, dst, delta) => {
+        let mut next_deadline = SteadyTime::now() + Duration::seconds(1);
+        loop {
+            match self.rx
+                .recv_timeout((next_deadline - SteadyTime::now()).to_std().expect("std::time")) {
+                Ok(StatUpdate::TstampVals(src, dst, delta)) => {
                     self.stats
                         .entry((dst, src))
-                        .or_insert_with(|| FlowStat::new(src, dst))
+                        .or_insert_with(|| FlowStat::new())
                         .record(delta)
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    next_deadline = SteadyTime::now() + Duration::seconds(1);
+                    for (&(src, dst), stat) in self.stats.iter() {
+                        info!("{}:{}: {}", src, dst, stat);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     }
@@ -224,35 +232,30 @@ impl Flow {
     }
 }
 impl FlowStat {
-    fn new(src: SocketAddr, dst: SocketAddr) -> Self {
-        FlowStat {
-            src: src,
-            dst: dst,
-            histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram"),
-        }
+    fn new() -> Self {
+        FlowStat { histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram") }
     }
 
     fn record(&mut self, delta: Duration) {
         if let Some(us) = delta.num_microseconds()
             .and_then(|v| if v > 0 { Some(v) } else { None }) {
             self.histogram_us.record_value(us as u64);
-            debug!("{}", {
-                use std::fmt::Write;
-                let mut s = String::new();
-                write!(&mut s, "{}:{}; {};", self.src, self.dst, delta).expect("writeln");
-                let mut cumulative = 0;
-                for pct in self.histogram_us.percentile_iter(1) {
-                    cumulative += pct.count;
-                    write!(&mut s,
-                           " {:.3}%/{}:{}μs",
-                           pct.percentile,
-                           cumulative,
-                           pct.value)
-                        .expect("writeln");
-                }
-                s
-            });
         }
+    }
+}
+
+impl fmt::Display for FlowStat {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let mut cumulative = 0;
+        for pct in self.histogram_us.percentile_iter(1) {
+            cumulative += pct.count;
+            try!(write!(fmt,
+                        " {:.3}%/{}:{}μs",
+                        pct.percentile,
+                        cumulative,
+                        pct.value));
+        }
+        Ok(())
     }
 }
 
