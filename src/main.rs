@@ -33,6 +33,8 @@ use hyper::header::ContentType;
 use hyper::server::{Server, Request, Response};
 use hyper::mime::Mime;
 
+const TWO_SQRT: f64 = 1.4142135623730951;
+
 #[derive(Clone,Eq,PartialEq,Hash)]
 struct FlowKey(SocketAddr, SocketAddr);
 
@@ -216,7 +218,7 @@ impl StatsTracker {
             let mut cumulative = 0;
             let mut sum = 0f64;
             let mut buckets = Vec::new();
-            for (value, _percentile, count, _nsamples) in stat.histogram_us.iter_percentiles(1) {
+            for (value, _percentile, count, _nsamples) in stat.histogram_us.iter_log(1, TWO_SQRT) {
                 cumulative += count;
                 sum += value as f64;
                 let mut b = proto::Bucket::new();
@@ -361,12 +363,11 @@ fn main() {
         .name("http".to_string())
         .spawn({
             let stats = stats.clone();
-            let addr = "127.0.0.1:9898";
+            let addr = "0.0.0.0:9898";
             println!("listening addr {:?}", addr);
             let server = Server::http(addr).expect("http server");
             move || {
                 server.handle(move |_req: Request, mut res: Response| {
-                        println!("Req: {:?}", (_req.method, _req.uri, _req.headers));
                         let mut buffer = Vec::new();
                         let encoder = TextEncoder::new();
                         encoder.encode(&stats.to_metric_families(), &mut buffer).expect("encode");
