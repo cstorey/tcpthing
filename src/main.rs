@@ -25,7 +25,7 @@ use hdrhistogram::Histogram;
 use std::sync::mpsc;
 use std::thread;
 use std::fmt;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, max};
 
 #[derive(Clone,Eq,PartialEq,Hash)]
 struct FlowKey(SocketAddr, SocketAddr);
@@ -192,8 +192,9 @@ impl StatsTracker {
     fn process_all(&mut self) {
         let mut next_deadline = SteadyTime::now() + Duration::seconds(1);
         loop {
+            let delta = max(next_deadline - SteadyTime::now(), Duration::seconds(0));
             match self.rx
-                .recv_timeout((next_deadline - SteadyTime::now()).to_std().expect("std::time")) {
+                .recv_timeout(delta.to_std().expect("std::time")) {
                 Ok(StatUpdate::TstampVals(src, dst, delta)) => {
                     self.stats
                         .entry(FlowKey(dst, src))
