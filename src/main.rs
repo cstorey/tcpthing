@@ -87,7 +87,8 @@ impl Flows {
                                         (p[7] as u32) << 0;
 
                             print!("@{}.{:09}: {:?}\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} ",
-                                    now.sec, now.nsec,
+                                   now.sec,
+                                   now.nsec,
                                    flow,
                                    tsval,
                                    tsecr,
@@ -182,14 +183,24 @@ impl Flow {
 fn main() {
     env_logger::init().expect("env_logger");
 
-    let iface_name = env::args().nth(1).unwrap();
+    let mut args = env::args().skip(1);
+    let iface_name = args.next().expect("device name");
     println!("Using: {:?}", iface_name);
+    let mut program = String::new();
+    for a in args {
+        program.push_str(&a);
+        program.push(' ');
+    }
 
-    let rx = pcap::Capture::from_device(&*iface_name)
+    let mut rx = pcap::Capture::from_device(&*iface_name)
         .expect("device")
         .tstamp_type(pcap::TstampType::Adapter)
         .open()
         .expect("open dev");
+    if !program.is_empty() {
+        rx.filter(&program).expect("bpf filter");
+        println!("Using program: {}", program);
+    }
 
     let mut captor = Flows::new();
 
