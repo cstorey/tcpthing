@@ -5,7 +5,7 @@ extern crate log;
 extern crate env_logger;
 extern crate hex_slice;
 extern crate time;
-extern crate hdrhistogram;
+extern crate hdrsample;
 extern crate lru_time_cache;
 extern crate prometheus;
 extern crate protobuf;
@@ -21,7 +21,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::collections::BTreeMap;
 use std::num::Wrapping;
 use time::{Timespec, SteadyTime, Duration};
-use hdrhistogram::Histogram;
+use hdrsample::Histogram;
 use std::sync::mpsc;
 use std::thread;
 use std::fmt;
@@ -65,7 +65,7 @@ struct Flow {
 }
 
 struct FlowStat {
-    histogram_us: Histogram,
+    histogram_us: Histogram<u64>,
 }
 
 #[derive(Debug,Clone)]
@@ -135,7 +135,7 @@ impl Tracker {
                                 .observe_echo(now, tsecr);
 
                             use  pnet::packet::tcp::TcpFlags::*;
-                            debug!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} \
+                            trace!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} \
                                     flags: {}; rtt:{:?}",
                                    src,
                                    dst,
@@ -192,26 +192,30 @@ impl StatsTracker {
     fn process_all(&mut self) {
         let mut next_deadline = SteadyTime::now() + Duration::seconds(1);
         loop {
-            let delta = max(next_deadline - SteadyTime::now(), Duration::seconds(0));
+            let now = SteadyTime::now();
+            if next_deadline <= now {
+                next_deadline = SteadyTime::now() + Duration::seconds(1);
+                self.dump_stats();
+            }
+
+            let delta = max(next_deadline - now, Duration::seconds(0));
             match self.rx
                 .recv_timeout(delta.to_std().expect("std::time")) {
                 Ok(StatUpdate::TstampVals(src, dst, delta)) => {
-                    self.stats
+                    let mut ent = self.stats
                         .entry(FlowKey(dst, src))
-                        .or_insert_with(|| FlowStat::new())
-                        .record(delta)
+                        .or_insert_with(|| FlowStat::new());
+                    ent.record(delta);
+                    debug!("Record: {}:{}; {}", src, dst, ent);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    next_deadline = SteadyTime::now() + Duration::seconds(1);
-                    self.dump_stats();
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     }
     fn dump_stats(&mut self) {
         use protobuf::RepeatedField;
-        use prometheus::{Opts, Registry, Counter, TextEncoder, Encoder};
+        use prometheus::{TextEncoder, Encoder};
         use prometheus::proto;
         use std::io::{self, Write};
         let mut metric_families = Vec::new();
@@ -222,12 +226,12 @@ impl StatsTracker {
             let mut cumulative = 0;
             let mut sum = 0f64;
             let mut buckets = Vec::new();
-            for pct in stat.histogram_us.percentile_iter(1) {
-                cumulative += pct.count;
-                sum += pct.value as f64;
+            for (value, _percentile, count, _nsamples) in stat.histogram_us.iter_percentiles(1) {
+                cumulative += count;
+                sum += value as f64;
                 let mut b = proto::Bucket::new();
                 b.set_cumulative_count(cumulative);
-                b.set_upper_bound(pct.highest_equivalent_value as f64);
+                b.set_upper_bound(value as f64);
                 buckets.push(b);
             }
             h.set_bucket(RepeatedField::from_vec(buckets));
@@ -307,27 +311,21 @@ impl Flow {
 }
 impl FlowStat {
     fn new() -> Self {
-        FlowStat { histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram") }
+        FlowStat { histogram_us: Histogram::new(3).expect("hdrhistogram") }
     }
 
     fn record(&mut self, delta: Duration) {
         if let Some(us) = delta.num_microseconds()
             .and_then(|v| if v > 0 { Some(v) } else { None }) {
-            self.histogram_us.record_value(us as u64);
+            self.histogram_us.record(us).expect("record");
         }
     }
 }
 
 impl fmt::Display for FlowStat {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let mut cumulative = 0;
-        for pct in self.histogram_us.percentile_iter(1) {
-            cumulative += pct.count;
-            try!(write!(fmt,
-                        " {:.3}%/{}:{}μs",
-                        pct.percentile,
-                        cumulative,
-                        pct.value));
+        for (value, percentile, count, _nsamples) in self.histogram_us.iter_percentiles(1) {
+            try!(write!(fmt, " {:.3}%/{}:{}μs", percentile, count, value));
         }
         Ok(())
     }

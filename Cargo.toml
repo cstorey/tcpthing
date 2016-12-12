@@ -5,7 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 env_logger = "0.3.5"
-hdrhistogram = "0.1.13"
+hdrsample = "2.1.1"
 log = "0.3.6"
 lru_time_cache = "0.5.0"
 pcap = "0.5.7"
