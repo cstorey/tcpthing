@@ -22,8 +22,26 @@ use hdrhistogram::Histogram;
 use std::sync::mpsc;
 use std::thread;
 use std::fmt;
+use std::cmp::Ordering;
 
-type FlowKey = (SocketAddr, SocketAddr);
+#[derive(Clone,Eq,PartialEq,Hash)]
+struct FlowKey(SocketAddr, SocketAddr);
+
+impl PartialOrd for FlowKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port())
+            .partial_cmp(&(other.0.ip(), other.0.port(), other.1.ip(), other.1.port()))
+    }
+}
+
+impl Ord for FlowKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port())
+            .cmp(&(other.0.ip(), other.0.port(), other.1.ip(), other.1.port()))
+    }
+}
+
+
 
 struct Tracker {
     flows: HashMap<FlowKey, Flow>,
@@ -32,7 +50,7 @@ struct Tracker {
 
 struct StatsTracker {
     rx: mpsc::Receiver<StatUpdate>,
-    stats: HashMap<FlowKey, FlowStat>,
+    stats: BTreeMap<FlowKey, FlowStat>,
 }
 
 type TSVal = Wrapping<u32>;
@@ -105,11 +123,11 @@ impl Tracker {
                                         (p[7] as u32) << 0;
 
                             self.flows
-                                .entry((src, dst))
+                                .entry(FlowKey(src, dst))
                                 .or_insert_with(|| Flow::new())
                                 .observe_outgoing(now, tsval);
                             let obs = self.flows
-                                .entry((dst, src))
+                                .entry(FlowKey(dst, src))
                                 .or_insert_with(|| Flow::new())
                                 .observe_echo(now, tsecr);
 
@@ -165,7 +183,7 @@ impl StatsTracker {
     fn new(rx: mpsc::Receiver<StatUpdate>) -> Self {
         StatsTracker {
             rx: rx,
-            stats: HashMap::new(),
+            stats: BTreeMap::new(),
         }
     }
     fn process_all(&mut self) {
@@ -175,13 +193,13 @@ impl StatsTracker {
                 .recv_timeout((next_deadline - SteadyTime::now()).to_std().expect("std::time")) {
                 Ok(StatUpdate::TstampVals(src, dst, delta)) => {
                     self.stats
-                        .entry((dst, src))
+                        .entry(FlowKey(dst, src))
                         .or_insert_with(|| FlowStat::new())
                         .record(delta)
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     next_deadline = SteadyTime::now() + Duration::seconds(1);
-                    for (&(src, dst), stat) in self.stats.iter() {
+                    for (&FlowKey(src, dst), stat) in self.stats.iter() {
                         info!("{}:{}: {}", src, dst, stat);
                     }
                 }
