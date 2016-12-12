@@ -19,11 +19,18 @@ use std::collections::{HashMap, BTreeMap};
 use std::num::Wrapping;
 use time::{Timespec, Duration};
 use hdrhistogram::Histogram;
+use std::sync::mpsc;
+use std::thread;
 
 type FlowKey = (SocketAddr, SocketAddr);
 
 struct Tracker {
     flows: HashMap<FlowKey, Flow>,
+    stats: mpsc::SyncSender<StatUpdate>,
+}
+
+struct StatsTracker {
+    rx: mpsc::Receiver<StatUpdate>,
     stats: HashMap<FlowKey, FlowStat>,
 }
 
@@ -36,14 +43,21 @@ struct Flow {
 }
 
 struct FlowStat {
+    src: SocketAddr,
+    dst: SocketAddr,
     histogram_us: Histogram,
 }
 
+#[derive(Debug,Clone)]
+enum StatUpdate {
+    TstampVals(SocketAddr, SocketAddr, Duration),
+}
+
 impl Tracker {
-    fn new() -> Self {
+    fn new(rx: mpsc::SyncSender<StatUpdate>) -> Self {
         Tracker {
             flows: HashMap::new(),
-            stats: HashMap::new(),
+            stats: rx,
         }
     }
 
@@ -78,8 +92,6 @@ impl Tracker {
                                                                    tcp.get_source()));
                         let dst = SocketAddr::V4(SocketAddrV4::new(ipv4.get_destination(),
                                                                    tcp.get_destination()));
-                        let flow = (src, dst);
-
                         // println!("{:?}: expected sz: {:?}; len: {:?}", flow, tcp.packet_size(), ipv4.packet().len());
 
                         if let Some(ts) = tcp.get_options_iter()
@@ -93,26 +105,6 @@ impl Tracker {
                                         (p[6] as u32) << 8 |
                                         (p[7] as u32) << 0;
 
-                            print!("@{}.{:09}: {:?}\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} ",
-                                   now.sec,
-                                   now.nsec,
-                                   flow,
-                                   tsval,
-                                   tsecr,
-                                   tcp.get_sequence(),
-                                   tcp.get_acknowledgement());
-                            use  pnet::packet::tcp::TcpFlags::*;
-                            for &(chr, flag) in &[('A', ACK), ('C', CWR), ('E', ECE), ('F', FIN),
-                                                  ('N', NS), ('P', PSH), ('R', RST), ('S', SYN),
-                                                  ('U', URG)] {
-                                if (tcp.get_flags() & flag) != 0 {
-                                    print!("{}", chr);
-                                } else {
-                                    print!(".");
-                                }
-                            }
-                            print!("\t");
-
                             self.flows
                                 .entry((src, dst))
                                 .or_insert_with(|| Flow::new())
@@ -121,13 +113,38 @@ impl Tracker {
                                 .entry((dst, src))
                                 .or_insert_with(|| Flow::new())
                                 .observe_echo(now, tsecr);
+
+                            use  pnet::packet::tcp::TcpFlags::*;
+                            debug!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} \
+                                    flags: {}; rtt:{:?}",
+                                   src,
+                                   dst,
+                                   tsval,
+                                   tsecr,
+                                   tcp.get_sequence(),
+                                   tcp.get_acknowledgement(),
+
+                                   &[('A', ACK), ('C', CWR), ('E', ECE), ('F', FIN), ('N', NS),
+                                     ('P', PSH), ('R', RST), ('S', SYN), ('U', URG)]
+                                       .iter()
+                                       .cloned()
+                                       .filter_map(|(chr, flag)| {
+                                    if (tcp.get_flags() & flag) != 0 {
+                                        Some(chr)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                       .collect::<String>(),
+                                   obs);
+
                             if let Some(obs) = obs {
-                                self.stats
-                                    .entry((dst, src))
-                                    .or_insert_with(|| FlowStat::new())
-                                    .record(obs)
+                                match self.stats.try_send(StatUpdate::TstampVals(src, dst, obs)) {
+                                    Ok(_) => (),
+                                    Err(mpsc::TrySendError::Full(e)) => warn!("Drop for {:?}", e),
+                                    Err(e) => panic!("Unexpected: {:?}", e),
+                                }
                             }
-                            println!("");
                             // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
                         } else {
                             // Approxmate using sequence numbers?
@@ -142,6 +159,27 @@ impl Tracker {
                 warn!("Ignoring: {:?}", other);
             }
         };
+    }
+}
+
+impl StatsTracker {
+    fn new(rx: mpsc::Receiver<StatUpdate>) -> Self {
+        StatsTracker {
+            rx: rx,
+            stats: HashMap::new(),
+        }
+    }
+    fn process_all(&mut self) {
+        for upd in self.rx.iter() {
+            match upd {
+                StatUpdate::TstampVals(src, dst, delta) => {
+                    self.stats
+                        .entry((dst, src))
+                        .or_insert_with(|| FlowStat::new(src, dst))
+                        .record(delta)
+                }
+            }
+        }
     }
 }
 
@@ -177,7 +215,6 @@ impl Flow {
         if tsdelta < HALF_U32 {
             if let Some(stamp) = self.observed.remove(&tsecr) {
                 let delta = at - stamp;
-                print!("\tRTT: {}", delta);
 
                 self.seen_echo = Some(tsecr);
                 return Some(delta);
@@ -187,20 +224,34 @@ impl Flow {
     }
 }
 impl FlowStat {
-    fn new() -> Self {
-        FlowStat { histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram") }
+    fn new(src: SocketAddr, dst: SocketAddr) -> Self {
+        FlowStat {
+            src: src,
+            dst: dst,
+            histogram_us: Histogram::init(1, 10_000_000, 2).expect("hdrhistogram"),
+        }
     }
 
     fn record(&mut self, delta: Duration) {
         if let Some(us) = delta.num_microseconds()
             .and_then(|v| if v > 0 { Some(v) } else { None }) {
             self.histogram_us.record_value(us as u64);
-            print!("/{}μs", us as u64);
-            let mut cumulative = 0;
-            for pct in self.histogram_us.percentile_iter(1) {
-                cumulative += pct.count;
-                print!(" {:.3}%/{}:{}μs", pct.percentile, cumulative, pct.value);
-            }
+            debug!("{}", {
+                use std::fmt::Write;
+                let mut s = String::new();
+                write!(&mut s, "{}:{}; {};", self.src, self.dst, delta).expect("writeln");
+                let mut cumulative = 0;
+                for pct in self.histogram_us.percentile_iter(1) {
+                    cumulative += pct.count;
+                    write!(&mut s,
+                           " {:.3}%/{}:{}μs",
+                           pct.percentile,
+                           cumulative,
+                           pct.value)
+                        .expect("writeln");
+                }
+                s
+            });
         }
     }
 }
@@ -217,17 +268,23 @@ fn main() {
         program.push(' ');
     }
 
-    let mut rx = pcap::Capture::from_device(&*iface_name)
+    let mut pcap = pcap::Capture::from_device(&*iface_name)
         .expect("device")
         .tstamp_type(pcap::TstampType::Adapter)
         .open()
         .expect("open dev");
     if !program.is_empty() {
-        rx.filter(&program).expect("bpf filter");
+        pcap.filter(&program).expect("bpf filter");
         println!("Using program: {}", program);
     }
 
-    let mut captor = Tracker::new();
+    let (tx, rx) = mpsc::sync_channel(1024);
+    let mut captor = Tracker::new(tx);
+    let mut stats = StatsTracker::new(rx);
+    thread::Builder::new()
+        .name("stats".to_string())
+        .spawn(move || stats.process_all())
+        .expect("thread spawn");
 
-    captor.process_from(rx);
+    captor.process_from(pcap);
 }
