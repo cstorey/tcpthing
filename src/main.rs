@@ -6,6 +6,7 @@ extern crate env_logger;
 extern crate hex_slice;
 extern crate time;
 extern crate hdrhistogram;
+extern crate lru_time_cache;
 
 use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
@@ -15,7 +16,7 @@ use pnet::packet::tcp::TcpPacket;
 use pnet::packet::tcp::TcpOptionNumbers::TIMESTAMPS;
 use std::env;
 use std::net::{SocketAddr, SocketAddrV4};
-use std::collections::{HashMap, BTreeMap};
+use std::collections::BTreeMap;
 use std::num::Wrapping;
 use time::{Timespec, SteadyTime, Duration};
 use hdrhistogram::Histogram;
@@ -41,16 +42,16 @@ impl Ord for FlowKey {
     }
 }
 
-
+use lru_time_cache::LruCache;
 
 struct Tracker {
-    flows: HashMap<FlowKey, Flow>,
+    flows: LruCache<FlowKey, Flow>,
     stats: mpsc::SyncSender<StatUpdate>,
 }
 
 struct StatsTracker {
     rx: mpsc::Receiver<StatUpdate>,
-    stats: BTreeMap<FlowKey, FlowStat>,
+    stats: LruCache<FlowKey, FlowStat>,
 }
 
 type TSVal = Wrapping<u32>;
@@ -73,7 +74,7 @@ enum StatUpdate {
 impl Tracker {
     fn new(rx: mpsc::SyncSender<StatUpdate>) -> Self {
         Tracker {
-            flows: HashMap::new(),
+            flows: LruCache::with_capacity(1024),
             stats: rx,
         }
     }
@@ -183,7 +184,7 @@ impl StatsTracker {
     fn new(rx: mpsc::Receiver<StatUpdate>) -> Self {
         StatsTracker {
             rx: rx,
-            stats: BTreeMap::new(),
+            stats: LruCache::with_capacity(1024),
         }
     }
     fn process_all(&mut self) {
