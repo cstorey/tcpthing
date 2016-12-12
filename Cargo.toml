@@ -8,6 +8,7 @@ env_logger = "0.3.5"
 hdrhistogram = "0.1.13"
 log = "0.3.6"
 pnet = "0.14.0"
+pcap = "0.5.7"
 time = "0.1.35"
 
 [dependencies.hex-slice]

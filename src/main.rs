@@ -1,4 +1,5 @@
 extern crate pnet;
+extern crate pcap;
 #[macro_use]
 extern crate log;
 extern crate env_logger;
@@ -6,24 +7,17 @@ extern crate hex_slice;
 extern crate time;
 extern crate hdrhistogram;
 
-use pnet::datalink::{self, NetworkInterface};
-
 use pnet::packet::Packet;
-use pnet::packet::arp::ArpPacket;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
+use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::ipv6::Ipv6Packet;
-use pnet::datalink::EthernetDataLinkReceiver;
 use pnet::packet::tcp::TcpPacket;
-use pnet::packet::PacketSize;
 use pnet::packet::tcp::TcpOptionNumbers::TIMESTAMPS;
 use std::env;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::collections::{HashMap, BTreeMap};
 use std::num::Wrapping;
-use hex_slice::AsHex;
-use time::{SteadyTime, Duration};
+use time::Timespec;
 use hdrhistogram::Histogram;
 
 type FlowKey = (SocketAddr, SocketAddr);
@@ -35,7 +29,7 @@ struct Flows {
 type TSVal = Wrapping<u32>;
 struct Flow {
     // this should probably be some kind of cache instead.
-    observed: BTreeMap<TSVal, SteadyTime>,
+    observed: BTreeMap<TSVal, Timespec>,
     seen_value: Option<TSVal>,
     seen_echo: Option<TSVal>,
     histogram_us: Histogram,
@@ -46,21 +40,21 @@ impl Flows {
         Flows { flows: HashMap::new() }
     }
 
-    fn now(&self) -> SteadyTime {
-        SteadyTime::now()
-    }
-
-    fn process_from(&mut self, mut rx: Box<EthernetDataLinkReceiver>) {
-        let mut iter = rx.iter();
+    fn process_from(&mut self, mut rx: pcap::Capture<pcap::Active>) {
         loop {
-            match iter.next() {
+            match rx.next() {
                 Ok(packet) => self.handle_packet(&packet),
                 Err(e) => panic!("packetdump: unable to receive packet: {}", e),
             }
         }
     }
 
-    fn handle_packet(&mut self, ethernet: &EthernetPacket) {
+    fn handle_packet(&mut self, packet: &pcap::Packet) {
+        let ethernet = EthernetPacket::new(packet.data).expect("ethernet packet");
+        let now = {
+            let ts = packet.header.ts;
+            Timespec::new(ts.tv_sec, ts.tv_usec as i32 * 1000)
+        };
         match ethernet.get_ethertype() {
             EtherTypes::Ipv4 => {
                 if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
@@ -92,8 +86,8 @@ impl Flows {
                                         (p[6] as u32) << 8 |
                                         (p[7] as u32) << 0;
 
-                            let t = self.now();
-                            print!("{:?}\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} ",
+                            print!("@{}.{:09}: {:?}\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} ",
+                                    now.sec, now.nsec,
                                    flow,
                                    tsval,
                                    tsecr,
@@ -114,11 +108,11 @@ impl Flows {
                             self.flows
                                 .entry((src, dst))
                                 .or_insert_with(|| Flow::new())
-                                .observe_outgoing(t, tsval);
+                                .observe_outgoing(now, tsval);
                             self.flows
                                 .entry((dst, src))
                                 .or_insert_with(|| Flow::new())
-                                .observe_echo(t, tsecr);
+                                .observe_echo(now, tsecr);
                             println!("");
                             // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
                         } else {
@@ -150,7 +144,7 @@ impl Flow {
         }
     }
 
-    fn observe_outgoing(&mut self, at: SteadyTime, tsval: u32) {
+    fn observe_outgoing(&mut self, at: Timespec, tsval: u32) {
         let tsval = Wrapping(tsval);
         // If it's before or equal to this value, modulo
         let tsdelta = self.seen_value.map(|v| (tsval - v)).unwrap_or(HALF_SUB_EPSILON);
@@ -162,7 +156,7 @@ impl Flow {
             self.seen_value = Some(tsval)
         }
     }
-    fn observe_echo(&mut self, at: SteadyTime, tsecr: u32) {
+    fn observe_echo(&mut self, at: Timespec, tsecr: u32) {
         let tsecr = Wrapping(tsecr);
         let tsdelta = self.seen_echo.map(|v| (tsecr - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("{:?}", self);
@@ -174,8 +168,9 @@ impl Flow {
                 if let Some(us) = delta.num_microseconds()
                     .and_then(|v| if v > 0 { Some(v) } else { None }) {
                     self.histogram_us.record_value(us as u64);
-                    if let Ok(b64) = self.histogram_us.encode() {
-                        print!("\t{}", b64);
+                    print!("/{}μs", us as u64);
+                    for pct in self.histogram_us.percentile_iter(1) {
+                        print!(" {:.3}%:{}μs", pct.percentile, pct.value);
                     }
                 }
                 self.seen_echo = Some(tsecr);
@@ -185,24 +180,16 @@ impl Flow {
 }
 
 fn main() {
-    use pnet::datalink::Channel::Ethernet;
     env_logger::init().expect("env_logger");
 
     let iface_name = env::args().nth(1).unwrap();
     println!("Using: {:?}", iface_name);
-    let interface_names_match = |iface: &NetworkInterface| iface.name == iface_name;
 
-    // Find the network interface with the provided name
-    let interfaces = datalink::interfaces();
-    println!("Found interfaces: {:?}", interfaces);
-    let interface = interfaces.into_iter().filter(interface_names_match).next().unwrap();
-
-    // Create a channel to receive on
-    let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("packetdump: unhandled channel type: {}"),
-        Err(e) => panic!("packetdump: unable to create channel: {}", e),
-    };
+    let rx = pcap::Capture::from_device(&*iface_name)
+        .expect("device")
+        .tstamp_type(pcap::TstampType::Adapter)
+        .open()
+        .expect("open dev");
 
     let mut captor = Flows::new();
 
