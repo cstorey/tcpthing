@@ -210,7 +210,7 @@ impl StatsTracker {
     fn to_metric_families(&self) -> Vec<prometheus::proto::MetricFamily> {
         use protobuf::RepeatedField;
         use prometheus::proto;
-        let mut metric_families = Vec::new();
+        let mut metrics = Vec::new();
         let stats = self.stats.read().expect("read lock");
         for (&FlowKey(src, dst), stat) in stats.peek_iter() {
             let mut h = proto::Histogram::new();
@@ -247,14 +247,15 @@ impl StatsTracker {
                 .collect()));
             metric.set_histogram(h);
 
-            let mut mf = proto::MetricFamily::new();
-            mf.set_name("tcp_rtt_us".to_string());
-            mf.set_help("TCP Timestamp RTT".to_string());
-            mf.set_field_type(proto::MetricType::HISTOGRAM);
-            mf.set_metric(RepeatedField::from_vec(vec![metric]));
-            metric_families.push(mf)
+            metrics.push(metric)
         }
-        metric_families
+        let mut mf = proto::MetricFamily::new();
+        mf.set_name("tcp_rtt_us".to_string());
+        mf.set_help("TCP Timestamp RTT".to_string());
+        mf.set_field_type(proto::MetricType::HISTOGRAM);
+        mf.set_metric(RepeatedField::from_vec(metrics));
+
+        vec![mf]
     }
 }
 
@@ -368,7 +369,9 @@ fn main() {
             let server = Server::http(addr).expect("http server");
             move || {
                 server.handle(move |_req: Request, mut res: Response| {
+                        info!("Req: {:?}", (_req.method, _req.uri));
                         let mut buffer = Vec::new();
+
                         let encoder = TextEncoder::new();
                         encoder.encode(&stats.to_metric_families(), &mut buffer).expect("encode");
 
