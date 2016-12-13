@@ -66,11 +66,15 @@ struct StatsTracker {
 }
 
 type TSVal = Wrapping<u32>;
+type Seq = Wrapping<u32>;
+#[derive(Debug,Clone,Default)]
 struct Flow {
     // this should probably be some kind of cache instead.
     observed: BTreeMap<TSVal, Timespec>,
     seen_value: Option<TSVal>,
     seen_echo: Option<TSVal>,
+    seen_seq: Option<Seq>,
+    seen_ack: Option<Seq>,
 }
 
 struct FlowStat {
@@ -174,11 +178,11 @@ impl Tracker {
             self.flows
                 .entry(FlowKey(src, dst))
                 .or_insert_with(|| Flow::new())
-                .observe_outgoing(now, tsval);
+                .observe_outgoing(now, tsval, tcp.get_sequence());
             let obs = self.flows
                 .entry(FlowKey(dst, src))
                 .or_insert_with(|| Flow::new())
-                .observe_echo(now, tsecr);
+                .observe_echo(now, tsecr, tcp.get_acknowledgement());
 
             use  pnet::packet::tcp::TcpFlags::*;
             trace!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} flags: {}; rtt:{:?}",
@@ -292,41 +296,46 @@ impl StatsTracker {
     }
 }
 
-const HALF_U32: TSVal = Wrapping(0x80000000);
-const HALF_SUB_EPSILON: TSVal = Wrapping(0x7fffffff);
+const HALF_U32: Wrapping<u32> = Wrapping(0x80000000);
+const ZERO_U32: Wrapping<u32> = Wrapping(0x0);
+const HALF_SUB_EPSILON: Wrapping<u32> = Wrapping(0x7fffffff);
 
 impl Flow {
     fn new() -> Self {
-        Flow {
-            observed: BTreeMap::new(),
-            seen_value: None,
-            seen_echo: None,
-        }
+        Flow::default()
     }
 
-    fn observe_outgoing(&mut self, at: Timespec, tsval: u32) {
+    fn observe_outgoing(&mut self, at: Timespec, tsval: u32, seq: u32) {
         let tsval = Wrapping(tsval);
+        let seq = Wrapping(seq);
         // If it's before or equal to this value, modulo
         let tsdelta = self.seen_value.map(|v| (tsval - v)).unwrap_or(HALF_SUB_EPSILON);
+        let seqdelta = self.seen_seq.map(|v| (seq - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("");
         // println!("{:?}", self);
-        // println!("val delta:{:08x}", tsdelta);
+        debug!("val ts delta:{:08x}; seqdelta: {:?}", tsdelta, seqdelta);
         if tsdelta < HALF_U32 {
             self.observed.insert(tsval, at);
-            self.seen_value = Some(tsval)
+            self.seen_value = Some(tsval);
+            self.seen_seq = Some(seq);
         }
     }
-    fn observe_echo(&mut self, at: Timespec, tsecr: u32) -> Option<Duration> {
+    fn observe_echo(&mut self, at: Timespec, tsecr: u32, ack: u32) -> Option<Duration> {
         let tsecr = Wrapping(tsecr);
+        let ack = Wrapping(ack);
         let tsdelta = self.seen_echo.map(|v| (tsecr - v)).unwrap_or(HALF_SUB_EPSILON);
+        let ackdelta = self.seen_ack.map(|v| (ack - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("{:?}", self);
-        // println!("ecr delta:{:08x}", tsdelta);
-        if tsdelta < HALF_U32 {
+        trace!("ecr delta:{:#10x}; ack delta: {:#10x}", tsdelta, ackdelta);
+        if tsdelta < HALF_U32 && ackdelta != ZERO_U32 && ackdelta < HALF_U32 {
             if let Some(stamp) = self.observed.remove(&tsecr) {
                 let delta = at - stamp;
 
                 self.seen_echo = Some(tsecr);
+                self.seen_ack = Some(ack);
                 return Some(delta);
+            } else {
+                trace!("No recorded tsval: {:?}", tsecr);
             }
         }
         None
