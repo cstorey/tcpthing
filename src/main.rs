@@ -248,7 +248,7 @@ impl StatsTracker {
             let mut buckets = Vec::new();
             trace!("{}:{}", src, dst);
             for (value, _percentile, _count, nsamples) in stat.histogram_us.iter_log(1, TWO_SQRT) {
-                trace!("{},{},{},{}", value, _percentile, _count, nsamples);
+                // trace!("{},{},{},{}", value, _percentile, _count, nsamples);
                 cumulative += nsamples as u64;
                 sum += value as f64;
                 let mut b = proto::Bucket::new();
@@ -279,13 +279,16 @@ impl StatsTracker {
 
             metrics.push(metric)
         }
-        let mut mf = proto::MetricFamily::new();
-        mf.set_name("tcp_rtt_us".to_string());
-        mf.set_help("TCP Timestamp RTT".to_string());
-        mf.set_field_type(proto::MetricType::HISTOGRAM);
-        mf.set_metric(RepeatedField::from_vec(metrics));
-
-        vec![mf]
+        if metrics.len() > 0 {
+            let mut mf = proto::MetricFamily::new();
+            mf.set_name("tcp_rtt_us".to_string());
+            mf.set_help("TCP Timestamp RTT".to_string());
+            mf.set_field_type(proto::MetricType::HISTOGRAM);
+            mf.set_metric(RepeatedField::from_vec(metrics));
+            vec![mf]
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -403,7 +406,8 @@ fn main() {
                         let mut buffer = Vec::new();
 
                         let encoder = TextEncoder::new();
-                        encoder.encode(&stats.to_metric_families(), &mut buffer).expect("encode");
+                        let stats = stats.to_metric_families();
+                        encoder.encode(&stats, &mut buffer).expect("encode");
 
                         res.headers_mut().set(ContentType(encoder.format_type()
                             .parse::<Mime>()
