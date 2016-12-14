@@ -420,6 +420,7 @@ fn main() {
     let mut pcap = pcap::Capture::from_device(&*iface_name)
         .expect("device")
         .tstamp_type(pcap::TimestampType::Adapter)
+        .promisc(true)
         .open()
         .expect("open dev");
     if !program.is_empty() {
