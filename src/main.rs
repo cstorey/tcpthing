@@ -250,7 +250,7 @@ impl StatsTracker {
             let mut cumulative = 0;
             let mut sum = 0f64;
             let mut buckets = Vec::new();
-            trace!("{}:{}", src, dst);
+            // trace!("{}:{}", src, dst);
             for (value, _percentile, _count, nsamples) in stat.histogram_us.iter_log(1, TWO_SQRT) {
                 // trace!("{},{},{},{}", value, _percentile, _count, nsamples);
                 cumulative += nsamples as u64;
@@ -313,7 +313,7 @@ impl Flow {
         let seqdelta = self.seen_seq.map(|v| (seq - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("");
         // println!("{:?}", self);
-        debug!("val ts delta:{:08x}; seqdelta: {:?}", tsdelta, seqdelta);
+        trace!("val ts delta:{:08x}; seqdelta: {:?}", tsdelta, seqdelta);
         if tsdelta < HALF_U32 {
             self.observed.insert(tsval, at);
             self.seen_value = Some(tsval);
