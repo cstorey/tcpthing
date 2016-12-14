@@ -41,23 +41,18 @@ struct FlowKey(SocketAddr, SocketAddr);
 
 impl PartialOrd for FlowKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port()).partial_cmp(&(
-            other.0.ip(),
-            other.0.port(),
-            other.1.ip(),
-            other.1.port(),
-        ))
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FlowKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port()).cmp(&(
-            other.0.ip(),
-            other.0.port(),
-            other.1.ip(),
-            other.1.port(),
-        ))
+        self.0
+            .ip()
+            .cmp(&other.0.ip())
+            .then_with(|| self.0.port().cmp(&other.0.port()))
+            .then_with(|| self.1.ip().cmp(&other.1.ip()))
+            .then_with(|| self.1.port().cmp(&other.1.port()))
     }
 }
 

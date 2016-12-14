@@ -18,3 +18,5 @@ time = "0.1.35"
 [dependencies.hex-slice]
 git = "https://github.com/cstorey/hex-slice"
 optional = false
+[profile.release]
+debug=true
