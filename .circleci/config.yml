@@ -31,6 +31,7 @@ jobs:
     steps:
       - run: sudo apt-get update && sudo apt-get install libpcap-dev
       - checkout
+      - run: git merge master
       - run: rustup component add rustfmt
       - run: rustfmt --version
       - run: cargo fmt --all -- --check
