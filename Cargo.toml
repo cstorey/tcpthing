@@ -4,7 +4,7 @@ name = "tcpthing"
 version = "0.1.0"
 
 [dependencies]
-env_logger = "0.3.5"
+env_logger = "0.6.1"
 hdrsample = "2.1.1"
 hyper = { version = "0.9.13", default-features = false }
 log = "0.3.6"
