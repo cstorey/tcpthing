@@ -411,7 +411,7 @@ fn process_all(stats: &mut StatsTracker, rx: mpsc::Receiver<StatUpdate>) {
 }
 
 fn main() {
-    env_logger::init().expect("env_logger");
+    env_logger::init();
 
     let mut args = env::args().skip(1);
     let iface_name = args.next().expect("device name");
