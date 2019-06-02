@@ -1,55 +1,63 @@
-extern crate pnet;
 extern crate pcap;
+extern crate pnet;
 #[macro_use]
 extern crate log;
 extern crate env_logger;
-extern crate hex_slice;
-extern crate time;
 extern crate hdrsample;
+extern crate hex_slice;
+extern crate hyper;
 extern crate lru_time_cache;
 extern crate prometheus;
 extern crate protobuf;
-extern crate hyper;
+extern crate time;
 
-use pnet::packet::Packet;
+use hdrsample::Histogram;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::TcpPacket;
 use pnet::packet::tcp::TcpOptionNumbers::TIMESTAMPS;
-use std::env;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::Packet;
+use prometheus::{Encoder, TextEncoder};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::env;
+use std::fmt;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
-use time::{Timespec, Duration};
-use hdrsample::Histogram;
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
-use std::fmt;
-use std::cmp::Ordering;
-use prometheus::{TextEncoder, Encoder};
+use time::{Duration, Timespec};
 
 use hyper::header::ContentType;
-use hyper::server::{Server, Request, Response};
 use hyper::mime::Mime;
+use hyper::server::{Request, Response, Server};
 
 const TWO_SQRT: f64 = 1.4142135623730951;
 
-#[derive(Clone,Eq,PartialEq,Hash)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 struct FlowKey(SocketAddr, SocketAddr);
 
 impl PartialOrd for FlowKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port())
-            .partial_cmp(&(other.0.ip(), other.0.port(), other.1.ip(), other.1.port()))
+        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port()).partial_cmp(&(
+            other.0.ip(),
+            other.0.port(),
+            other.1.ip(),
+            other.1.port(),
+        ))
     }
 }
 
 impl Ord for FlowKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port())
-            .cmp(&(other.0.ip(), other.0.port(), other.1.ip(), other.1.port()))
+        (self.0.ip(), self.0.port(), self.1.ip(), self.1.port()).cmp(&(
+            other.0.ip(),
+            other.0.port(),
+            other.1.ip(),
+            other.1.port(),
+        ))
     }
 }
 
@@ -67,7 +75,7 @@ struct StatsTracker {
 
 type TSVal = Wrapping<u32>;
 type Seq = Wrapping<u32>;
-#[derive(Debug,Clone,Default)]
+#[derive(Debug, Clone, Default)]
 struct Flow {
     // this should probably be some kind of cache instead.
     observed: BTreeMap<TSVal, Timespec>,
@@ -81,7 +89,7 @@ struct FlowStat {
     histogram_us: Histogram<u64>,
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 enum StatUpdate {
     TstampVals(SocketAddr, SocketAddr, Duration),
 }
@@ -121,10 +129,12 @@ impl Tracker {
                     };
 
                     if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
-                        let src = SocketAddr::V4(SocketAddrV4::new(ipv4.get_source(),
-                                                                   tcp.get_source()));
-                        let dst = SocketAddr::V4(SocketAddrV4::new(ipv4.get_destination(),
-                                                                   tcp.get_destination()));
+                        let src =
+                            SocketAddr::V4(SocketAddrV4::new(ipv4.get_source(), tcp.get_source()));
+                        let dst = SocketAddr::V4(SocketAddrV4::new(
+                            ipv4.get_destination(),
+                            tcp.get_destination(),
+                        ));
                         self.process_tcp_packet(now, src, dst, tcp)
                     }
                 }
@@ -140,15 +150,18 @@ impl Tracker {
                     };
 
                     if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
-
-                        let src = SocketAddr::V6(SocketAddrV6::new(ipv6.get_source(),
-                                                                   tcp.get_source(),
-                                                                   ipv6.get_flow_label(),
-                                                                   0));
-                        let dst = SocketAddr::V6(SocketAddrV6::new(ipv6.get_destination(),
-                                                                   tcp.get_destination(),
-                                                                   ipv6.get_flow_label(),
-                                                                   0));
+                        let src = SocketAddr::V6(SocketAddrV6::new(
+                            ipv6.get_source(),
+                            tcp.get_source(),
+                            ipv6.get_flow_label(),
+                            0,
+                        ));
+                        let dst = SocketAddr::V6(SocketAddrV6::new(
+                            ipv6.get_destination(),
+                            tcp.get_destination(),
+                            ipv6.get_flow_label(),
+                            0,
+                        ));
                         self.process_tcp_packet(now, src, dst, tcp)
                     }
                 }
@@ -159,53 +172,68 @@ impl Tracker {
         };
     }
 
-    fn process_tcp_packet(&mut self,
-                          now: Timespec,
-                          src: SocketAddr,
-                          dst: SocketAddr,
-                          tcp: TcpPacket) {
+    fn process_tcp_packet(
+        &mut self,
+        now: Timespec,
+        src: SocketAddr,
+        dst: SocketAddr,
+        tcp: TcpPacket,
+    ) {
         // println!("{:?}: expected sz: {:?}; len: {:?}", flow, tcp.packet_size(), ipv4.packet().len());
 
-        if let Some(ts) = tcp.get_options_iter()
+        if let Some(ts) = tcp
+            .get_options_iter()
             .filter(|o| o.get_number() == TIMESTAMPS)
-            .next() {
+            .next()
+        {
             let p = ts.payload();
-            let tsval = (p[0] as u32) << 24 | (p[1] as u32) << 16 | (p[2] as u32) << 8 |
-                        (p[3] as u32) << 0;
-            let tsecr = (p[4] as u32) << 24 | (p[5] as u32) << 16 | (p[6] as u32) << 8 |
-                        (p[7] as u32) << 0;
+            let tsval =
+                (p[0] as u32) << 24 | (p[1] as u32) << 16 | (p[2] as u32) << 8 | (p[3] as u32) << 0;
+            let tsecr =
+                (p[4] as u32) << 24 | (p[5] as u32) << 16 | (p[6] as u32) << 8 | (p[7] as u32) << 0;
 
             self.flows
                 .entry(FlowKey(src, dst))
                 .or_insert_with(|| Flow::new())
                 .observe_outgoing(now, tsval, tcp.get_sequence());
-            let obs = self.flows
+            let obs = self
+                .flows
                 .entry(FlowKey(dst, src))
                 .or_insert_with(|| Flow::new())
                 .observe_echo(now, tsecr, tcp.get_acknowledgement());
 
-            use  pnet::packet::tcp::TcpFlags::*;
-            trace!("{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} flags: {}; rtt:{:?}",
-                   src,
-                   dst,
-                   tsval,
-                   tsecr,
-                   tcp.get_sequence(),
-                   tcp.get_acknowledgement(),
-
-                   &[('A', ACK), ('C', CWR), ('E', ECE), ('F', FIN), ('N', NS), ('P', PSH),
-                     ('R', RST), ('S', SYN), ('U', URG)]
-                       .iter()
-                       .cloned()
-                       .filter_map(|(chr, flag)| {
+            use pnet::packet::tcp::TcpFlags::*;
+            trace!(
+                "{}:{};\tts: val: {}; ecr: {}\tseq: {}; ack: {:?} flags: {}; rtt:{:?}",
+                src,
+                dst,
+                tsval,
+                tsecr,
+                tcp.get_sequence(),
+                tcp.get_acknowledgement(),
+                &[
+                    ('A', ACK),
+                    ('C', CWR),
+                    ('E', ECE),
+                    ('F', FIN),
+                    ('N', NS),
+                    ('P', PSH),
+                    ('R', RST),
+                    ('S', SYN),
+                    ('U', URG)
+                ]
+                .iter()
+                .cloned()
+                .filter_map(|(chr, flag)| {
                     if (tcp.get_flags() & flag) != 0 {
                         Some(chr)
                     } else {
                         None
                     }
                 })
-                       .collect::<String>(),
-                   obs);
+                .collect::<String>(),
+                obs
+            );
 
             if let Some(obs) = obs {
                 match self.stats.try_send(StatUpdate::TstampVals(src, dst, obs)) {
@@ -214,34 +242,35 @@ impl Tracker {
                     Err(e) => panic!("Unexpected: {:?}", e),
                 }
             }
-            // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
+        // println!("Flow: sd:{:?} ds:{:?}", self.flows.get(&(src, dst)), self.flows.get(&(dst, src)));
         } else {
             // Approxmate using sequence numbers?
         }
-
     }
 }
 
 impl StatsTracker {
     fn new() -> Self {
-        StatsTracker { stats: Arc::new(RwLock::new(LruCache::with_capacity(1024))) }
+        StatsTracker {
+            stats: Arc::new(RwLock::new(LruCache::with_capacity(1024))),
+        }
     }
 
     fn process(&mut self, update: StatUpdate) {
         match update {
             StatUpdate::TstampVals(src, dst, delta) => {
                 let mut stats = self.stats.write().expect("write lock");
-                let mut ent = stats.entry(FlowKey(dst, src))
+                let mut ent = stats
+                    .entry(FlowKey(dst, src))
                     .or_insert_with(|| FlowStat::new());
                 ent.record(delta);
                 trace!("Record: {}:{}; {}; {}", src, dst, delta, ent);
-
             }
         }
     }
     fn to_metric_families(&self) -> Vec<prometheus::proto::MetricFamily> {
-        use protobuf::RepeatedField;
         use prometheus::proto;
+        use protobuf::RepeatedField;
         let mut metrics = Vec::new();
         let stats = self.stats.read().expect("read lock");
         for (&FlowKey(src, dst), stat) in stats.peek_iter() {
@@ -265,12 +294,13 @@ impl StatsTracker {
             h.set_sample_count(cumulative);
 
             let mut metric = proto::Metric::new();
-            metric.set_label(RepeatedField::from_vec(vec![
-                        ("src_ip", format!("{}", src.ip())),
-                        ("dst_ip", format!("{}", dst.ip())),
-                        ("src_port", format!("{}", src.port())),
-                        ("dst_port", format!("{}", dst.port())),
-                            ]
+            metric.set_label(RepeatedField::from_vec(
+                vec![
+                    ("src_ip", format!("{}", src.ip())),
+                    ("dst_ip", format!("{}", dst.ip())),
+                    ("src_port", format!("{}", src.port())),
+                    ("dst_port", format!("{}", dst.port())),
+                ]
                 .into_iter()
                 .map(|(k, v)| {
                     let mut lp = proto::LabelPair::new();
@@ -278,7 +308,8 @@ impl StatsTracker {
                     lp.set_value(v);
                     lp
                 })
-                .collect()));
+                .collect(),
+            ));
             metric.set_histogram(h);
 
             metrics.push(metric)
@@ -309,7 +340,10 @@ impl Flow {
         let tsval = Wrapping(tsval);
         let seq = Wrapping(seq);
         // If it's before or equal to this value, modulo
-        let tsdelta = self.seen_value.map(|v| (tsval - v)).unwrap_or(HALF_SUB_EPSILON);
+        let tsdelta = self
+            .seen_value
+            .map(|v| (tsval - v))
+            .unwrap_or(HALF_SUB_EPSILON);
         let seqdelta = self.seen_seq.map(|v| (seq - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("");
         // println!("{:?}", self);
@@ -323,7 +357,10 @@ impl Flow {
     fn observe_echo(&mut self, at: Timespec, tsecr: u32, ack: u32) -> Option<Duration> {
         let tsecr = Wrapping(tsecr);
         let ack = Wrapping(ack);
-        let tsdelta = self.seen_echo.map(|v| (tsecr - v)).unwrap_or(HALF_SUB_EPSILON);
+        let tsdelta = self
+            .seen_echo
+            .map(|v| (tsecr - v))
+            .unwrap_or(HALF_SUB_EPSILON);
         let ackdelta = self.seen_ack.map(|v| (ack - v)).unwrap_or(HALF_SUB_EPSILON);
         // println!("{:?}", self);
         trace!("ecr delta:{:#10x}; ack delta: {:#10x}", tsdelta, ackdelta);
@@ -343,12 +380,16 @@ impl Flow {
 }
 impl FlowStat {
     fn new() -> Self {
-        FlowStat { histogram_us: Histogram::new(3).expect("hdrhistogram") }
+        FlowStat {
+            histogram_us: Histogram::new(3).expect("hdrhistogram"),
+        }
     }
 
     fn record(&mut self, delta: Duration) {
-        if let Some(us) = delta.num_microseconds()
-            .and_then(|v| if v > 0 { Some(v) } else { None }) {
+        if let Some(us) = delta
+            .num_microseconds()
+            .and_then(|v| if v > 0 { Some(v) } else { None })
+        {
             self.histogram_us.record(us).expect("record");
         }
     }
@@ -410,7 +451,8 @@ fn main() {
             println!("listening addr {:?}", addr);
             let server = Server::http(addr).expect("http server");
             move || {
-                server.handle(move |_req: Request, mut res: Response| {
+                server
+                    .handle(move |_req: Request, mut res: Response| {
                         info!("Req: {:?}", (_req.method, _req.uri));
                         let mut buffer = Vec::new();
 
@@ -418,9 +460,9 @@ fn main() {
                         let stats = stats.to_metric_families();
                         encoder.encode(&stats, &mut buffer).expect("encode");
 
-                        res.headers_mut().set(ContentType(encoder.format_type()
-                            .parse::<Mime>()
-                            .expect("mime parse")));
+                        res.headers_mut().set(ContentType(
+                            encoder.format_type().parse::<Mime>().expect("mime parse"),
+                        ));
                         res.send(&buffer).expect("send")
                     })
                     .expect("server")
