@@ -5,7 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 env_logger = "0.6.1"
-hyper = { version = "0.9.13", default-features = false }
+hyper = "0.12.29"
 log = "0.4.6"
 lru_time_cache = "0.9.0"
 pcap = "0.7.0"
