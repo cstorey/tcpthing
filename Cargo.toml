@@ -5,7 +5,6 @@ version = "0.1.0"
 
 [dependencies]
 env_logger = "0.6.1"
-hdrsample = "2.1.1"
 hyper = { version = "0.9.13", default-features = false }
 log = "0.4.6"
 lru_time_cache = "0.9.0"
@@ -14,6 +13,7 @@ pnet = "0.22.0"
 prometheus = "0.6.0"
 protobuf = "2.6.1"
 time = "0.1.35"
+hdrhistogram = "6.2.0"
 
 [dependencies.hex-slice]
 git = "https://github.com/cstorey/hex-slice"

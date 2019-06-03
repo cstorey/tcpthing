@@ -3,7 +3,7 @@ extern crate pnet;
 #[macro_use]
 extern crate log;
 extern crate env_logger;
-extern crate hdrsample;
+extern crate hdrhistogram;
 extern crate hex_slice;
 extern crate hyper;
 extern crate lru_time_cache;
@@ -11,7 +11,7 @@ extern crate prometheus;
 extern crate protobuf;
 extern crate time;
 
-use hdrsample::Histogram;
+use hdrhistogram::Histogram;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -275,13 +275,14 @@ impl StatsTracker {
             let mut sum = 0f64;
             let mut buckets = Vec::new();
             // trace!("{}:{}", src, dst);
-            for (value, _percentile, _count, nsamples) in stat.histogram_us.iter_log(1, TWO_SQRT) {
+            for value in stat.histogram_us.iter_log(1, TWO_SQRT) {
+                // (value, _percentile, _count, nsamples)
                 // trace!("{},{},{},{}", value, _percentile, _count, nsamples);
-                cumulative += nsamples as u64;
-                sum += value as f64;
+                cumulative += value.count_at_value() as u64;
+                sum += value.value_iterated_to() as f64;
                 let mut b = proto::Bucket::new();
                 b.set_cumulative_count(cumulative);
-                b.set_upper_bound(value as f64);
+                b.set_upper_bound(value.value_iterated_to() as f64);
                 buckets.push(b);
             }
             h.set_bucket(RepeatedField::from_vec(buckets));
@@ -385,15 +386,21 @@ impl FlowStat {
             .num_microseconds()
             .and_then(|v| if v > 0 { Some(v) } else { None })
         {
-            self.histogram_us.record(us).expect("record");
+            self.histogram_us.record(us as u64).expect("record");
         }
     }
 }
 
 impl fmt::Display for FlowStat {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        for (value, percentile, _count, nsamples) in self.histogram_us.iter_percentiles(1) {
-            try!(write!(fmt, " {:.3}%/{}:{}μs", percentile, nsamples, value));
+        for value in self.histogram_us.iter_quantiles(1) {
+            write!(
+                fmt,
+                " {:.3}%/{}:{}μs",
+                value.percentile(),
+                value.count_since_last_iteration(),
+                value.value_iterated_to()
+            )?;
         }
         Ok(())
     }
