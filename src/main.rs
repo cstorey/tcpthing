@@ -30,9 +30,11 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use time::{Duration, Timespec};
 
-use hyper::header::ContentType;
-use hyper::mime::Mime;
-use hyper::server::{Request, Response, Server};
+use hyper::header::CONTENT_TYPE;
+use hyper::rt::Future;
+use hyper::server::Server;
+use hyper::service::service_fn;
+use hyper::{Body, Request, Response};
 
 const TWO_SQRT: f64 = 1.4142135623730951;
 
@@ -449,26 +451,27 @@ fn main() {
     thread::Builder::new()
         .name("http".to_string())
         .spawn({
-            let stats = stats.clone();
-            let addr = "0.0.0.0:9898";
-            println!("listening addr {:?}", addr);
-            let server = Server::http(addr).expect("http server");
+            let make_service = move || {
+                let stats = stats.clone();
+                service_fn(move |_req: Request<Body>| -> Result<Response<Body>, _> {
+                    info!("Req: {:?}", (_req.method(), _req.uri()));
+                    let mut buffer = Vec::new();
+
+                    let encoder = TextEncoder::new();
+                    let stats = stats.to_metric_families();
+                    encoder.encode(&stats, &mut buffer).expect("encode");
+                    Response::builder()
+                        .header(CONTENT_TYPE, encoder.format_type())
+                        .body(Body::from(buffer))
+                })
+            };
             move || {
-                server
-                    .handle(move |_req: Request, mut res: Response| {
-                        info!("Req: {:?}", (_req.method, _req.uri));
-                        let mut buffer = Vec::new();
-
-                        let encoder = TextEncoder::new();
-                        let stats = stats.to_metric_families();
-                        encoder.encode(&stats, &mut buffer).expect("encode");
-
-                        res.headers_mut().set(ContentType(
-                            encoder.format_type().parse::<Mime>().expect("mime parse"),
-                        ));
-                        res.send(&buffer).expect("send")
-                    })
-                    .expect("server")
+                let addr = "0.0.0.0:9898".parse().expect("bind address");
+                println!("listening addr {:?}", addr);
+                let s = Server::bind(&addr).serve(make_service).map_err(|e| {
+                    eprintln!("server error: {}", e);
+                });
+                hyper::rt::run(s)
             }
         })
         .expect("serve");
